@@ -982,6 +982,13 @@
         category: 'Siswa',
         databaseTab: 'Dashboard',
         dashboardStats: null,
+        schoolProfile: null,
+        leadershipSettings: null,
+        journalStaffLoaded: false,
+        journalHistoryCache: {},
+        archivePeopleLoaded: false,
+        archiveRecordsLoaded: false,
+        recordCache: {},
         importCsvBusy: false,
         journalTab: 'entry',
         journalStaff: [],
@@ -1018,6 +1025,28 @@
 
       const CATEGORIES = ['Guru', 'Tenaga Pendidik', 'Siswa'];
       const $ = function (selector) { return document.querySelector(selector); };
+
+      function callBackend(method) {
+        const args = Array.prototype.slice.call(arguments, 1);
+        return new Promise(function (resolve, reject) {
+          const runner = google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject);
+          runner[method].apply(runner, args);
+        });
+      }
+
+      function journalHistoryCacheKey(name, month) {
+        return JSON.stringify([String(name || ''), String(month || '')]);
+      }
+
+      function recordCacheKey(query, page, classFilter) {
+        return JSON.stringify([
+          String(query || '').trim(),
+          Number(page) || 1,
+          String(classFilter || '').trim()
+        ]);
+      }
 
       document.addEventListener('DOMContentLoaded', function () {
         $('#importCsvButton').addEventListener('click', openImportCsv);
@@ -1134,19 +1163,51 @@
       });
 
       function loadInitialData() {
-        google.script.run
-          .withSuccessHandler(function (data) {
+        const historyName = $('#historyName').value;
+        const historyMonth = $('#historyMonth').value;
+        callBackend('getInitialData').then(function (data) {
+          return Promise.all([
+            callBackend('getDashboardStats'),
+            callBackend('getSchoolProfile'),
+            callBackend('getLeadershipSettings'),
+            callBackend('getJournalStaff'),
+            callBackend('getJournalHistory', historyName, historyMonth),
+            callBackend('getArchivePeople'),
+            callBackend('getDigitalArchiveRecords'),
+            Promise.all(CATEGORIES.map(function (category) {
+              return callBackend('getRecords', category, '', 1, '');
+            }))
+          ]).then(function (startupData) {
             state.schemas = data.schemas;
             state.counts = data.counts;
+            state.dashboardStats = startupData[0];
+            state.schoolProfile = startupData[1];
+            state.leadershipSettings = startupData[2];
+            state.journalStaff = startupData[3];
+            state.journalStaffLoaded = true;
+            state.journalHistoryCache[journalHistoryCacheKey(historyName, historyMonth)] = startupData[4];
+            state.archivePeople = startupData[5];
+            state.archivePeopleLoaded = true;
+            state.archiveRecords = startupData[6];
+            state.archiveRecordsLoaded = true;
+            state.recordCache = {};
+            CATEGORIES.forEach(function (category, index) {
+              state.recordCache[category] = {};
+              state.recordCache[category][recordCacheKey('', 1, '')] = startupData[7][index];
+            });
+
             renderBrand(data.logoDataUri);
             renderNavigation();
             renderCategoryTabs();
             renderStats();
-            loadJournalStaff();
+            populateJournalNameFilters();
+            populateArchivePeople();
+            renderArchiveRecords(state.archiveRecords);
+            renderSchoolProfile(state.schoolProfile);
+            applyLeadershipSettings(state.leadershipSettings);
             showDashboard();
-          })
-          .withFailureHandler(showError)
-          .getInitialData();
+          });
+        }).catch(showError);
       }
 
       function renderBrand(logoDataUri) {
@@ -1227,13 +1288,16 @@
 
       function loadLeadershipSettings() {
         const button = $('#settingsSaveButton');
+        if (state.leadershipSettings !== null) {
+          applyLeadershipSettings(state.leadershipSettings);
+          button.disabled = false;
+          return;
+        }
         button.disabled = true;
         google.script.run
           .withSuccessHandler(function (settings) {
-            $('#principalName').value = settings.kepalaSekolah.name || '';
-            $('#principalNip').value = settings.kepalaSekolah.nip || '';
-            $('#tuHeadName').value = settings.kasubagTu.name || '';
-            $('#tuHeadNip').value = settings.kasubagTu.nip || '';
+            state.leadershipSettings = settings;
+            applyLeadershipSettings(settings);
             button.disabled = false;
           })
           .withFailureHandler(function (error) {
@@ -1243,12 +1307,30 @@
           .getLeadershipSettings();
       }
 
+      function applyLeadershipSettings(settings) {
+        $('#principalName').value = settings.kepalaSekolah.name || '';
+        $('#principalNip').value = settings.kepalaSekolah.nip || '';
+        $('#tuHeadName').value = settings.kasubagTu.name || '';
+        $('#tuHeadNip').value = settings.kasubagTu.nip || '';
+      }
+
       function saveSettings(event) {
         event.preventDefault();
         const button = $('#settingsSaveButton');
+        const settings = {
+          kepalaSekolah: {
+            name: $('#principalName').value,
+            nip: $('#principalNip').value
+          },
+          kasubagTu: {
+            name: $('#tuHeadName').value,
+            nip: $('#tuHeadNip').value
+          }
+        };
         button.disabled = true;
         google.script.run
           .withSuccessHandler(function (result) {
+            state.leadershipSettings = settings;
             button.disabled = false;
             showToast(result.message);
           })
@@ -1256,16 +1338,7 @@
             button.disabled = false;
             showError(error);
           })
-          .saveLeadershipSettings({
-            kepalaSekolah: {
-              name: $('#principalName').value,
-              nip: $('#principalNip').value
-            },
-            kasubagTu: {
-              name: $('#tuHeadName').value,
-              nip: $('#tuHeadNip').value
-            }
-          });
+          .saveLeadershipSettings(settings);
       }
 
       function downloadDataBackup() {
@@ -1371,9 +1444,16 @@
       }
 
       function loadDashboardStats() {
+        if (state.dashboardStats !== null) {
+          renderDashboardStats(state.dashboardStats);
+          return;
+        }
         $('#dashboardMetrics').innerHTML = '<div class="loading"><span class="spinner"></span>Memuat dashboard...</div>';
         google.script.run
-          .withSuccessHandler(renderDashboardStats)
+          .withSuccessHandler(function (result) {
+            state.dashboardStats = result;
+            renderDashboardStats(result);
+          })
           .withFailureHandler(showError)
           .getDashboardStats();
       }
@@ -1465,9 +1545,16 @@
         $('#pageTitle').textContent = 'Profil Sekolah';
         $('#pageSubtitle').textContent = 'Informasi profil SMAN 1 ANGKINANG.';
         renderCategoryTabs();
+        if (state.schoolProfile !== null) {
+          renderSchoolProfile(state.schoolProfile);
+          return;
+        }
         $('#schoolProfileContent').innerHTML = '<div class="loading"><span class="spinner"></span>Memuat profil sekolah...</div>';
         google.script.run
-          .withSuccessHandler(renderSchoolProfile)
+          .withSuccessHandler(function (groups) {
+            state.schoolProfile = groups;
+            renderSchoolProfile(groups);
+          })
           .withFailureHandler(showError)
           .getSchoolProfile();
       }
@@ -1488,9 +1575,14 @@
       }
 
       function loadJournalStaff() {
+        if (state.journalStaffLoaded) {
+          populateJournalNameFilters();
+          return;
+        }
         google.script.run
           .withSuccessHandler(function (names) {
             state.journalStaff = names;
+            state.journalStaffLoaded = true;
             populateJournalNameFilters();
           })
           .withFailureHandler(showError)
@@ -1498,9 +1590,14 @@
       }
 
       function loadArchivePeople() {
+        if (state.archivePeopleLoaded) {
+          populateArchivePeople();
+          return;
+        }
         google.script.run
           .withSuccessHandler(function (people) {
             state.archivePeople = people;
+            state.archivePeopleLoaded = true;
             populateArchivePeople();
           })
           .withFailureHandler(showError)
@@ -1555,7 +1652,7 @@
               button.disabled = false;
               button.textContent = '＋ Tambah foto kendaraan siswa';
               showToast(result.message);
-              refreshDashboard();
+              refreshDashboard('Siswa');
             })
             .withFailureHandler(function (error) {
               button.disabled = false;
@@ -1571,9 +1668,16 @@
       }
 
       function loadArchiveRecords() {
+        if (state.archiveRecordsLoaded) {
+          renderArchiveRecords(state.archiveRecords);
+          return;
+        }
         $('#archiveTableContainer').innerHTML = '<div class="loading"><span class="spinner"></span>Memuat berkas...</div>';
         google.script.run
-          .withSuccessHandler(renderArchiveRecords)
+          .withSuccessHandler(function (records) {
+            state.archiveRecordsLoaded = true;
+            renderArchiveRecords(records);
+          })
           .withFailureHandler(showError)
           .getDigitalArchiveRecords();
       }
@@ -1679,6 +1783,7 @@
               resetArchiveForm();
               populateArchivePeople();
               showToast(result.message || (isEditing ? 'Data berkas berhasil diperbarui.' : 'Berkas berhasil disimpan.'));
+              state.archiveRecordsLoaded = false;
               loadArchiveRecords();
             })
             .withFailureHandler(function (error) {
@@ -1765,6 +1870,7 @@
         google.script.run
           .withSuccessHandler(function (result) {
             showToast(result.message || 'Berkas berhasil dihapus.');
+            state.archiveRecordsLoaded = false;
             loadArchiveRecords();
           })
           .withFailureHandler(showError)
@@ -1988,6 +2094,7 @@
             state.journalEditId = null;
             button.textContent = 'Simpan jurnal';
             showToast('Jurnal harian berhasil disimpan.');
+            state.journalHistoryCache = {};
             if (state.journalTab === 'entry') loadJournalHistory();
           })
           .withFailureHandler(function (error) {
@@ -2080,6 +2187,7 @@
             state.journalEditBusy = false;
             closeJournalEdit();
             showToast(result.message || 'Jurnal harian berhasil diperbarui.');
+            state.journalHistoryCache = {};
             loadJournalHistory();
           })
           .withFailureHandler(function (error) {
@@ -2103,6 +2211,7 @@
         google.script.run
           .withSuccessHandler(function (result) {
             showToast(result.message);
+            state.journalHistoryCache = {};
             loadJournalHistory();
           })
           .withFailureHandler(showError)
@@ -2185,11 +2294,23 @@
       }
 
       function loadJournalHistory() {
+        const name = $('#historyName').value;
+        const month = $('#historyMonth').value;
+        const cacheKey = journalHistoryCacheKey(name, month);
+        if (Object.prototype.hasOwnProperty.call(state.journalHistoryCache, cacheKey)) {
+          renderJournalHistory(state.journalHistoryCache[cacheKey]);
+          return;
+        }
         $('#journalHistoryContainer').innerHTML = '<div class="loading"><span class="spinner"></span>Memuat history...</div>';
         google.script.run
-          .withSuccessHandler(renderJournalHistory)
+          .withSuccessHandler(function (result) {
+            state.journalHistoryCache[cacheKey] = result;
+            if (journalHistoryCacheKey($('#historyName').value, $('#historyMonth').value) === cacheKey) {
+              renderJournalHistory(result);
+            }
+          })
           .withFailureHandler(showError)
-          .getJournalHistory($('#historyName').value, $('#historyMonth').value);
+          .getJournalHistory(name, month);
       }
 
       function renderJournalHistory(result) {
@@ -2343,11 +2464,27 @@
       }
 
       function loadRecords() {
+        const category = state.category;
+        const query = $('#searchInput').value;
+        const classFilter = $('#studentClassFilter').value;
+        const cacheKey = recordCacheKey(query, state.page, classFilter);
+        const categoryCache = state.recordCache[category];
+        if (categoryCache && Object.prototype.hasOwnProperty.call(categoryCache, cacheKey)) {
+          renderRecords(categoryCache[cacheKey]);
+          return;
+        }
         $('#tableContainer').innerHTML = '<div class="loading"><span class="spinner"></span>Memuat data...</div>';
         google.script.run
-          .withSuccessHandler(renderRecords)
+          .withSuccessHandler(function (result) {
+            if (!state.recordCache[category]) state.recordCache[category] = {};
+            state.recordCache[category][cacheKey] = result;
+            if (state.category === category &&
+                recordCacheKey($('#searchInput').value, state.page, $('#studentClassFilter').value) === cacheKey) {
+              renderRecords(result);
+            }
+          })
           .withFailureHandler(showError)
-          .getRecords(state.category, $('#searchInput').value, state.page, $('#studentClassFilter').value);
+          .getRecords(category, query, state.page, classFilter);
       }
 
       function renderRecords(result) {
@@ -2633,7 +2770,7 @@
             closeStudentVehicleForm();
             if (recordIndex >= 0 && state.detailRecord === record) openItemDetail(recordIndex);
             showToast(result.message);
-            refreshDashboard();
+            refreshDashboard('Siswa');
           })
           .withFailureHandler(function (error) {
             state.studentVehicleBusy = false;
@@ -3012,6 +3149,7 @@
         new FormData($('#recordForm')).forEach(function (value, key) { values[key] = value; });
         values.PhotoDataUrl = state.photoDataUrl;
         values.VehiclePhotoDataUrl = state.vehiclePhotoDataUrl;
+        const category = state.category;
         button.disabled = true;
         button.textContent = 'Menyimpan...';
         google.script.run
@@ -3020,28 +3158,29 @@
             button.disabled = false;
             button.textContent = 'Simpan data';
             showToast('Data berhasil disimpan.');
-            refreshDashboard();
+            refreshDashboard(category);
           })
           .withFailureHandler(function (error) {
             button.disabled = false;
             button.textContent = state.editId === null ? 'Simpan data' : 'Simpan perubahan';
             showError(error);
           })
-          .saveRecord(state.category, state.editId, values);
+          .saveRecord(category, state.editId, values);
       }
 
       function removeRecord(index) {
         const record = state.records[index];
         if (!record) return;
+        const category = state.category;
         const name = record.values[0] || 'data ini';
         if (!window.confirm('Hapus data "' + name + '"? Tindakan ini tidak dapat dibatalkan.')) return;
         google.script.run
           .withSuccessHandler(function () {
             showToast('Data berhasil dihapus.');
-            refreshDashboard();
+            refreshDashboard(category);
           })
           .withFailureHandler(showError)
-          .deleteRecord(state.category, record.id);
+          .deleteRecord(category, record.id);
       }
 
       function openImportCsv() {
@@ -3112,7 +3251,7 @@
               setImportProgress(100, result.message +
                 (result.skipped ? ' ' + result.skipped + ' baris kosong dilewati.' : ''), false);
               showToast(result.message);
-              refreshDashboard();
+              refreshDashboard(category);
             })
             .withFailureHandler(function (error) {
               setImportBusy(false);
@@ -3129,7 +3268,13 @@
         reader.readAsText(file, 'UTF-8');
       }
 
-      function refreshDashboard() {
+      function refreshDashboard(changedCategory) {
+        state.dashboardStats = null;
+        if (changedCategory) {
+          state.recordCache[changedCategory] = {};
+          state.archivePeopleLoaded = false;
+          if (changedCategory === 'Tenaga Pendidik') state.journalStaffLoaded = false;
+        }
         google.script.run
           .withSuccessHandler(function (data) {
             state.counts = data.counts;
@@ -3137,6 +3282,8 @@
             renderCategoryTabs();
             renderStats();
             $('#tableDescription').textContent = (state.counts[state.category] || 0) + ' data tersimpan di spreadsheet.';
+            loadArchivePeople();
+            if (changedCategory === 'Tenaga Pendidik') loadJournalStaff();
             if (state.databaseTab === 'Dashboard') loadDashboardStats();
             else if (state.databaseTab !== 'Profil Sekolah') loadRecords();
           })
